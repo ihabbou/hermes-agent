@@ -125,13 +125,62 @@ commit; a failed copy rolls back, and a populated destination is refused. The
 SQLite source remains unchanged. Active leases, heartbeats, and application
 ledgers are not copied. Restart the destination profile after a successful copy.
 
+### Many instances on one server
+
+Each instance is a tenant with its own schema in one shared database. Give every
+instance a stable, unique schema name in its `config.yaml` (lowercase, at most 63
+characters, not starting with `pg_`). Derive it from the instance's identity,
+never from a host or volume, so a replaced instance finds its history again:
+
+```yaml
+database:
+  backend: postgres
+  schema: hermes_agent_0042
+  pool_max_size: 2
+```
+
+Tenants share no rows: a schema holds its own tables, indexes, triggers, and
+functions (15 tables and 42 indexes, about 480 KiB empty). The first writable open
+creates the schema in about 0.1 s; later opens only check its version. Schema
+upgrades from newer Hermes builds apply on each tenant's next writable open.
+Retiring a tenant is `DROP SCHEMA <name> CASCADE`.
+
+Run a transaction-pooling PgBouncer between the instances and PostgreSQL;
+direct connections from thousands of processes exceed any sensible
+`max_connections`. Hermes is built for this mode: the schema binds per
+transaction, server-side prepared statements are off, and no session-level
+locks or settings are used. A minimal configuration:
+
+```ini
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 12000        ; instances x pool_max_size, plus headroom
+default_pool_size = 50         ; server connections per database/user
+server_lifetime = 3600         ; recycle backends; see catalog cache below
+```
+
+Point `HERMES_DATABASE_URL` at PgBouncer. `pool_max_size` caps one process's
+client connections (default 2: a turn's writes plus the background usage
+writer).
+
+Every backend builds a catalog cache for each table it touches, and through
+PgBouncer one backend serves many tenants. `server_lifetime` bounds that growth.
+With thousands of schemas, also expect `pg_dump` to take minutes rather than
+seconds; filter it with `--schema` for per-tenant restores.
+
+The backend covers conversation state only. Cron, Kanban, the gateway delivery
+ledger, and other application stores keep their local SQLite files under
+`HERMES_HOME`; on disposable instance storage their contents (for example, a
+reply still owed when the instance is replaced) do not survive replacement.
+
 ### Test the backend
 
 The normal suite needs no PostgreSQL server. Backend integration tests opt in
 with `HERMES_TEST_POSTGRES=1`; CI supplies a disposable PostgreSQL 17 service at
 `127.0.0.1:55433`, database/user `hermes_test`/`hermes`, password `hermes-test`.
 Tests create and drop uniquely named schemas. They fail if opted-in PostgreSQL
-or its driver is unavailable.
+or its driver is unavailable. `HERMES_TEST_POSTGRES_URL` points them at another
+server, for example a transaction-pooling PgBouncer in front of it.
 
 ```bash
 HERMES_TEST_POSTGRES=1 scripts/run_tests.sh tests/hermes_state/test_postgres_*.py
