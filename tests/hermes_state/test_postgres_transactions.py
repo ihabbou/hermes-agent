@@ -29,7 +29,7 @@ def test_turn_lease_retries_postgres_writer_lock_timeout(postgres_db):
         with ThreadPoolExecutor(max_workers=1) as executor:
             acquired = executor.submit(
                 other.acquire_session_turn_lease, "leased", "worker", wait_seconds=5,
-                poll_interval_seconds=0.01, acquire_patience_s=0.01, on_wait=lambda elapsed: waiting.set())
+                poll_interval_seconds=0.01, acquire_patience_s=0.01, on_contended=waiting.set)
             try:
                 assert waiting.wait(10), "the lease caller did not retry the PostgreSQL lock timeout"
             finally:

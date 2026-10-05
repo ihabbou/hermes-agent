@@ -5,7 +5,27 @@ from hermes_state_common import FTS_TOOL_CONTENT_PREFIX_CHARS
 SEARCH_CONTENT_CHARS = 8_192
 SEARCH_TOOL_CALLS_CHARS = 4_096
 SEARCH_TOOL_NAME_CHARS = 256
-POSTGRES_SCHEMA_VERSION = 1
+# Version 1 is the original DDL below; later versions are POSTGRES_MIGRATIONS applied in order,
+# so a schema created by an older build upgrades in place on its next writable open.
+POSTGRES_MIGRATIONS = {
+    # Catch up with the SQLite columns and indexes added upstream after version 1 (SCHEMA_VERSION 31).
+    2: """
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS created_source TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS compression_overload_streak INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS auto_archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS message_uid TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS absorbed_message_uids TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_uids TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_uid TEXT;
+UPDATE messages SET message_uid = md5(random()::text || id::text) WHERE message_uid IS NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_platform_msg_id
+    ON messages(session_id, platform_message_id) WHERE platform_message_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_session_uid ON messages(session_id, message_uid) WHERE active = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique ON sessions(title) WHERE title IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_sessions_tool_names ON sessions(tool_names);
+""",
+}
+POSTGRES_SCHEMA_VERSION = max(POSTGRES_MIGRATIONS, default=1)
 
 POSTGRES_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (

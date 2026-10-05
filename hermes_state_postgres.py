@@ -21,12 +21,16 @@ from hermes_state import SessionDB, _default_db_path
 from hermes_state_backend import resolve_database_settings
 from hermes_state_common import SCHEMA_VERSION
 from hermes_state_postgres_schema import (
-    DISPLAY_SQL, FUNCTION_SQL, POSTGRES_SCHEMA_VERSION, POSTGRES_SCHEMA_SQL, SEARCH_SQL, TELEGRAM_SCHEMA_SQL,
+    DISPLAY_SQL, FUNCTION_SQL, POSTGRES_MIGRATIONS, POSTGRES_SCHEMA_VERSION, POSTGRES_SCHEMA_SQL, SEARCH_SQL, TELEGRAM_SCHEMA_SQL,
 )
 from hermes_state_postgres_search import SessionPostgresSearchMixin
 from hermes_state_postgres_maintenance import SessionPostgresMaintenanceMixin
 
-_BINDING_TOKEN = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|--[^\n]*|/\*.*?\*/|::|:[A-Za-z_]\w*|\?|%", re.S)
+# SQLite planner hints (``INDEXED BY idx`` / ``NOT INDEXED``) in shared SQL builders have no PostgreSQL
+# equivalent; dropping them here keeps every new upstream hint portable without per-call-site switches.
+_BINDING_TOKEN = re.compile(
+    r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|--[^\n]*|/\*.*?\*/"
+    r"|(?i:\bINDEXED\s+BY\s+\w+|\bNOT\s+INDEXED\b)|::|:[A-Za-z_]\w*|\?|%", re.S)
 
 
 @lru_cache(maxsize=256)
@@ -35,6 +39,8 @@ def _bind_parameters(statement: str) -> str:
         token = match.group()
         if token == '?':
             return '%s'
+        if token[0] in 'INin':
+            return ''
         if token.startswith(':') and token != '::':
             return f'%({token[1:]})s'
         return token.replace('%', '%%')
@@ -161,18 +167,22 @@ class PostgresSessionDB(SessionPostgresSearchMixin, SessionPostgresMaintenanceMi
             conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (self.schema,))
             conn.execute(sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(sql.Identifier(self.schema)))
             exists = conn.execute("SELECT to_regclass('postgres_schema_version')").fetchone()[0]
-            if exists is not None:
-                version = conn.execute('SELECT version FROM postgres_schema_version').fetchone()[0]
-                if version != POSTGRES_SCHEMA_VERSION:
-                    raise RuntimeError('Unsupported PostgreSQL schema version')
-                return
-            conn.execute(POSTGRES_SCHEMA_SQL)
-            conn.execute(FUNCTION_SQL)
-            conn.execute(DISPLAY_SQL)
-            conn.execute(SEARCH_SQL)
-            conn.execute('INSERT INTO schema_version(version) VALUES (%s)', (SCHEMA_VERSION,))
-            conn.execute('CREATE TABLE postgres_schema_version (version BIGINT PRIMARY KEY)')
-            conn.execute('INSERT INTO postgres_schema_version(version) VALUES (%s)', (POSTGRES_SCHEMA_VERSION,))
+            if exists is None:
+                conn.execute(POSTGRES_SCHEMA_SQL)
+                conn.execute(FUNCTION_SQL)
+                conn.execute(DISPLAY_SQL)
+                conn.execute(SEARCH_SQL)
+                conn.execute('INSERT INTO schema_version(version) VALUES (%s)', (SCHEMA_VERSION,))
+                conn.execute('CREATE TABLE postgres_schema_version (version BIGINT PRIMARY KEY)')
+                conn.execute('INSERT INTO postgres_schema_version(version) VALUES (1)')
+            version = conn.execute('SELECT version FROM postgres_schema_version').fetchone()[0]
+            if version > POSTGRES_SCHEMA_VERSION:
+                raise RuntimeError('PostgreSQL schema is newer than this Hermes build')
+            for target in sorted(v for v in POSTGRES_MIGRATIONS if v > version):
+                conn.execute(POSTGRES_MIGRATIONS[target])
+            if version < POSTGRES_SCHEMA_VERSION:
+                conn.execute('UPDATE postgres_schema_version SET version = %s', (POSTGRES_SCHEMA_VERSION,))
+                conn.execute('UPDATE schema_version SET version = %s', (SCHEMA_VERSION,))
 
     @contextmanager
     def _read_ctx(self):

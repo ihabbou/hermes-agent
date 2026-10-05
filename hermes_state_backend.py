@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from yaml import YAMLError
+from hermes_yaml import YAMLError
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, profile_name_for_home
 
