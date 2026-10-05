@@ -24,16 +24,16 @@ def test_turn_lease_retries_postgres_writer_lock_timeout(postgres_db):
     db = postgres_db
     db.create_session("leased", "cli")
     waiting = Event()
+    # A transaction-scoped lock, like a real writer's: a session lock would stay on whichever server
+    # connection a transaction-pooling PgBouncer handed out, and the contender could reuse it.
     with SessionDB(db.db_path) as other, db._pool.connection() as blocker:
-        blocker.execute("SELECT pg_advisory_lock(hashtextextended(%s, 0))", (db.schema,))
         with ThreadPoolExecutor(max_workers=1) as executor:
-            acquired = executor.submit(
-                other.acquire_session_turn_lease, "leased", "worker", wait_seconds=5,
-                poll_interval_seconds=0.01, acquire_patience_s=0.01, on_contended=waiting.set)
-            try:
+            with blocker.transaction():
+                blocker.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (db.schema,))
+                acquired = executor.submit(
+                    other.acquire_session_turn_lease, "leased", "worker", wait_seconds=5,
+                    poll_interval_seconds=0.01, acquire_patience_s=0.01, on_contended=waiting.set)
                 assert waiting.wait(10), "the lease caller did not retry the PostgreSQL lock timeout"
-            finally:
-                blocker.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (db.schema,))
             assert acquired.result(timeout=10) is True
         db.append_message("leased", "user", "owned receipt", turn_lease_holder="worker")
 

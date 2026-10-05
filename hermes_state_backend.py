@@ -18,6 +18,8 @@ class DatabaseSettings:
     backend: str = "sqlite"
     database_url: str | None = field(default=None, repr=False)
     schema: str | None = None
+    # Per-process cap. Hundreds of instances share one server, so keep this small and pool at PgBouncer.
+    pool_max_size: int = 2
 
 
 def resolve_database_settings(db_path: str | Path | None = None) -> DatabaseSettings:
@@ -70,4 +72,8 @@ def resolve_database_settings(db_path: str | Path | None = None) -> DatabaseSett
         raise ValueError("database.schema must be a lowercase PostgreSQL identifier of 1–63 characters")
     if schema.startswith("pg_"):
         raise ValueError("database.schema must not use PostgreSQL's reserved pg_ prefix")
-    return DatabaseSettings(backend=backend, database_url=database_url.strip(), schema=schema)
+    pool_max_size = database.get("pool_max_size", DatabaseSettings.pool_max_size)
+    if isinstance(pool_max_size, bool) or not isinstance(pool_max_size, int) or pool_max_size < 1:
+        raise ValueError("database.pool_max_size must be a positive integer")
+    return DatabaseSettings(backend=backend, database_url=database_url.strip(), schema=schema,
+                            pool_max_size=pool_max_size)

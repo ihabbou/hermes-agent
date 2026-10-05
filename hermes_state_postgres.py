@@ -129,23 +129,20 @@ class PostgresSessionDB(SessionPostgresSearchMixin, SessionPostgresMaintenanceMi
         self._fts_enabled = True
         self._fts_stale = self._fts_cjk_available = self._trigram_available = False
         self._write_count = 0
+        # Many instances share one server through a transaction-pooling PgBouncer, where a server
+        # connection serves a different client after every transaction. So nothing is set per
+        # session: the schema binds per transaction (_transaction), and server-side prepared
+        # statements stay off because they would be prepared on one backend and run on another.
         kwargs = dict(autocommit=True, row_factory=_row_factory, connect_timeout=5,
-                      application_name='hermes-agent')
-        schema = self.schema
-
-        def configure(conn):
-            conn.execute(sql.SQL('SET search_path TO {}, pg_catalog').format(sql.Identifier(schema)))
-            if read_only:
-                conn.execute('SET default_transaction_read_only = on')
-
+                      application_name='hermes-agent', prepare_threshold=None)
         try:
             with psycopg.connect(settings.database_url, **kwargs) as conn:
                 if conn.info.server_version < 170000:
                     raise ValueError('PostgreSQL session storage requires PostgreSQL 17 or later')
-                configure(conn)
+                self._search_path = sql.SQL('{}, pg_catalog').format(sql.Identifier(self.schema)).as_string(conn)
                 self._initialize_schema(conn)
-            self._pool = ConnectionPool(settings.database_url, kwargs=kwargs, configure=configure,
-                                        min_size=0, max_size=4, timeout=5, open=True)
+            self._pool = ConnectionPool(settings.database_url, kwargs=kwargs, min_size=0,
+                                        max_size=settings.pool_max_size, timeout=5, open=True)
         except psycopg.Error as exc:
             self._closed = True
             from hermes_state_guard import _set_last_init_error
@@ -156,9 +153,17 @@ class PostgresSessionDB(SessionPostgresSearchMixin, SessionPostgresMaintenanceMi
             self._closed = True
             raise
 
+    def _bind_transaction(self, conn):
+        """Scope the open transaction to this profile's schema (and read-only for read-only stores)."""
+        conn.execute("SELECT set_config('search_path', %s, true)", (self._search_path,))
+        if self.read_only:
+            conn.execute('SET TRANSACTION READ ONLY')
+
     def _initialize_schema(self, conn):
         if self.read_only:
-            version = conn.execute('SELECT version FROM postgres_schema_version').fetchone()[0]
+            with conn.transaction():
+                self._bind_transaction(conn)
+                version = conn.execute('SELECT version FROM postgres_schema_version').fetchone()[0]
             if version != POSTGRES_SCHEMA_VERSION:
                 raise RuntimeError('PostgreSQL schema requires a writable upgrade')
             return
@@ -166,6 +171,7 @@ class PostgresSessionDB(SessionPostgresSearchMixin, SessionPostgresMaintenanceMi
             conn.execute("SELECT set_config('lock_timeout', '5000', true)")
             conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (self.schema,))
             conn.execute(sql.SQL('CREATE SCHEMA IF NOT EXISTS {}').format(sql.Identifier(self.schema)))
+            self._bind_transaction(conn)
             exists = conn.execute("SELECT to_regclass('postgres_schema_version')").fetchone()[0]
             if exists is None:
                 conn.execute(POSTGRES_SCHEMA_SQL)
@@ -190,7 +196,9 @@ class PostgresSessionDB(SessionPostgresSearchMixin, SessionPostgresMaintenanceMi
             raise RuntimeError('SessionDB connection is closed')
         with self._pool.connection() as conn:
             with conn.transaction():
-                conn.execute('SET TRANSACTION READ ONLY')
+                self._bind_transaction(conn)
+                if not self.read_only:
+                    conn.execute('SET TRANSACTION READ ONLY')
                 yield PostgresConnection(conn)
 
     def _read_retrying_ioerr(self, fn):
@@ -215,6 +223,7 @@ class PostgresSessionDB(SessionPostgresSearchMixin, SessionPostgresMaintenanceMi
         deadline = time.monotonic() + patience
         with self._pool.connection() as conn:
             with conn.transaction():
+                self._bind_transaction(conn)
                 remaining = max(1, int((deadline - time.monotonic()) * 1000))
                 conn.execute("SELECT set_config('lock_timeout', %s, true)", (str(remaining),))
                 conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))', (self.schema,))

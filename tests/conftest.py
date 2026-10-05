@@ -1455,7 +1455,8 @@ def postgres_home(tmp_path, monkeypatch):
     import psycopg
     from psycopg import sql
 
-    database_url = "postgresql://hermes:hermes-test@127.0.0.1:55433/hermes_test"
+    database_url = os.environ.get(
+        "HERMES_TEST_POSTGRES_URL", "postgresql://hermes:hermes-test@127.0.0.1:55433/hermes_test")
     schema = f"test_{uuid.uuid4().hex}"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_DATABASE_URL", raising=False)

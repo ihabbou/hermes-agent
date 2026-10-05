@@ -53,30 +53,42 @@ class SessionPostgresMaintenanceMixin:
         if self.read_only:
             result["skipped"] = True
             return result
-        lock_key = f"{self.schema}:maintenance"
+        # Claim the run by advancing last_auto_prune inside one write transaction (serialized per
+        # schema by _execute_write's advisory xact lock). A session-level advisory lock would not
+        # survive transaction pooling, and holding a connection across the prune would need a
+        # second one from the pool.
+        now = time.time()
+
+        def claim(conn):
+            row = conn.execute("SELECT value FROM state_meta WHERE key = 'last_auto_prune'").fetchone()
+            previous = None if row is None else row[0]
+            since_prune = _seconds_since(now, previous)
+            if since_prune is not None and since_prune < min_interval_hours * 3600:
+                return False, previous
+            self.set_meta("last_auto_prune", str(now), cursor=conn)
+            return True, previous
+
         try:
-            with self._pool.connection() as conn:
-                acquired = conn.execute(
-                    "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (lock_key,)).fetchone()[0]
-                if not acquired:
-                    result["skipped"] = True
-                    return result
-                try:
-                    now = time.time()
-                    since_prune = _seconds_since(now, self.get_meta("last_auto_prune"))
-                    if since_prune is not None and since_prune < min_interval_hours * 3600:
-                        result["skipped"] = True
-                        return result
-                    result["pruned"] = self.prune_sessions(
-                        older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True)
-                    closed = self.sweep_orphaned_sessions(
-                        max_idle_seconds=float(retention_days) * 86400,
-                        sources=self._AUTO_PRUNE_STALE_OPEN_SOURCES, exclude_pinned=True,
-                        respect_gateway_heartbeats=False)
-                    result["closed"] = len(closed)
-                    self.set_meta("last_auto_prune", str(now))
-                finally:
-                    conn.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (lock_key,))
+            claimed, previous = self._execute_write(claim)
+            if not claimed:
+                result["skipped"] = True
+                return result
+            try:
+                result["pruned"] = self.prune_sessions(
+                    older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True)
+                closed = self.sweep_orphaned_sessions(
+                    max_idle_seconds=float(retention_days) * 86400,
+                    sources=self._AUTO_PRUNE_STALE_OPEN_SOURCES, exclude_pinned=True,
+                    respect_gateway_heartbeats=False)
+                result["closed"] = len(closed)
+            except Exception:
+                # Release the claim so the next open retries instead of waiting out the interval.
+                if previous is None:
+                    self._execute_write(lambda conn: conn.execute(
+                        "DELETE FROM state_meta WHERE key = 'last_auto_prune'"))
+                else:
+                    self.set_meta("last_auto_prune", previous)
+                raise
         except Exception as exc:
             logger.warning("PostgreSQL session maintenance failed: %s", exc)
             result["error"] = str(exc)
