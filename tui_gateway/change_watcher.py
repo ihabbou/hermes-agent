@@ -201,9 +201,28 @@ def _sessions_sig():
     unrelated state.db writes such as gateway heartbeats.
     """
     return tuple(
-        _session_db_content_sig(root / "state.db")
+        _session_store_sig(root / "state.db")
         for root in (_watcher_home(), *_served_profile_homes)
     )
+
+
+def _session_store_sig(db_path: Path):
+    """PostgreSQL has no file to stat; its trigger-maintained revision is the change signal."""
+    from hermes_state_backend import resolve_database_settings
+
+    try:
+        settings = resolve_database_settings(db_path)
+    except ValueError:
+        return "unavailable"
+    if settings.backend != "postgres":
+        return _session_db_content_sig(db_path)
+    from hermes_state import SessionDB
+
+    try:
+        with SessionDB(db_path, read_only=True, database_settings=settings) as db:
+            return ("postgres", settings.schema, db.get_change_revision())
+    except Exception:
+        return "unavailable"
 
 
 def _projects_sig():
